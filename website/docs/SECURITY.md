@@ -135,11 +135,11 @@ The `OperationRecorder.redact_metadata` method explicitly strips `signedUrl`, `c
 
 ### Database file permissions
 
-gflow creates `gflow.db` readable and writable only by its owner: mode `0600` on POSIX, an ACL naming only the current user on Windows. An existing database and its `-wal` and `-shm` files are tightened when gflow opens the database for writing. On Windows, each file instance is hardened once per process and re-hardened if SQLite recreates the sidecars or replaces the file. If opening the database creates its directory on POSIX, that directory is `0700`. gflow never changes the permissions of an existing directory here, because `GFLOW_CLI_DB_PATH` can name one that other software uses. This is best-effort: a failure is logged and does not stop the command.
+gflow creates `gflow.db` readable and writable only by its owner: mode `0600` on POSIX, an ACL naming only the current user on Windows. On Windows, absent `-wal` and `-shm` sidecar files are also pre-created empty and restricted before SQLite connects so SQLite reuses them rather than writing initial pages under inherited directory permissions (#1559). Any pre-existing database and `-wal`/`-shm` files are also tightened when gflow opens the database for writing. On Windows, each file instance is hardened once per process and re-hardened if SQLite recreates the sidecars or replaces the file. If opening the database creates its directory on POSIX, that directory is `0700`. gflow never changes the permissions of an existing directory here, because `GFLOW_CLI_DB_PATH` can name one that other software uses. This is best-effort: a failure is logged and does not stop the command.
 
 Limits:
 
-- On Windows, SQLite creates `-wal` and `-shm` with the directory's inherited ACL before `DataStore.open` restricts them prior to returning (before callers write prompts); a crash before that post-migration ACL pass may leave sidecars with inherited read access, and the next writable open attempts to tighten any existing sidecars. Use a private directory if you need protection during that brief creation window.
+- On Windows, each newly created `gflow.db`, `-wal`, or `-shm` file briefly carries the parent directory's inherited ACL between file creation and `icacls` stripping inheritance (before SQLite writes any data). Use a private directory if you need zero-window isolation in a shared folder.
 - On Windows, permissions someone explicitly granted on an existing `gflow.db`, `-wal`, or `-shm` file are kept.
 - Another account that shared the database through group, other, POSIX ACL or inherited Windows permissions loses access to it.
 - On POSIX, a database file that another account owns stays accessible to that account. On macOS, ACLs inherited from the directory are kept.

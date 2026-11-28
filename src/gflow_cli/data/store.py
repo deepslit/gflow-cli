@@ -7,7 +7,7 @@ import sqlite3
 import stat
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -35,19 +35,54 @@ logger = structlog.get_logger(__name__)
 _create_lock = threading.Lock()
 
 
-def _win32_sidecar_paths(path: Path, real: str) -> tuple[str, ...]:
-    """Sidecars SQLite creates on Windows (beside the opened path, not a symlink target)."""
+def _win32_opened_sidecar_paths(path: Path) -> tuple[str, str]:
+    """Sidecar paths SQLite opens on Windows (beside *path*, not a symlink target)."""
     opened = os.path.join(os.path.realpath(path.parent), path.name)
-    # Keep case-only differences distinct until batch hardening compares file identities.
-    bases = [real] if opened == real else [opened, real]
-    return tuple(f"{base}{suffix}" for base in bases for suffix in ("-wal", "-shm"))
+    return (f"{opened}-wal", f"{opened}-shm")
 
 
-def _secure_store_files(path: Path) -> str | None:
+def _win32_sidecar_paths(path: Path, real: str) -> tuple[str, ...]:
+    """Candidate Windows sidecar paths, keeping case-only differences distinct."""
+    opened = _win32_opened_sidecar_paths(path)
+    real_sidecars = (f"{real}-wal", f"{real}-shm")
+    return opened if opened == real_sidecars else (*opened, *real_sidecars)
+
+
+def _precreate_win32_sidecars(path: Path) -> tuple[str, ...]:
+    """Pre-create absent empty WAL/SHM files so ACLs hold before SQLite first writes them."""
+    created: list[str] = []
+    for sidecar in _win32_opened_sidecar_paths(path):
+        try:
+            with _create_lock:
+                # Windows CRT O_CREAT | O_EXCL follows dangling symlinks; skip any link first.
+                if os.path.lexists(sidecar):
+                    continue
+                os.close(os.open(sidecar, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            created.append(sidecar)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            logger.warning("file_acl_failed", error=type(exc).__name__)
+    return tuple(created)
+
+
+def _cleanup_empty_sidecars(paths: tuple[str, ...]) -> None:
+    """Remove empty pre-created sidecars if an open fails before SQLite populates them."""
+    for sidecar in paths:
+        with suppress(OSError):
+            st = os.lstat(sidecar)
+            if stat.S_ISREG(st.st_mode) and st.st_size == 0:
+                os.unlink(sidecar)
+
+
+def _secure_store_files(path: Path) -> tuple[str | None, tuple[str, ...]]:
     """Create the database owner-only, or drop group/other access from an existing one.
 
     Runs before SQLite opens the file. An existing directory is left alone:
-    ``GFLOW_CLI_DB_PATH`` can name one gflow does not own (issue #1437).
+    ``GFLOW_CLI_DB_PATH`` can name one gflow does not own (issue #1437). On
+    Windows, absent ``-wal``/``-shm`` files are also pre-created empty and
+    hardened before ``sqlite3.connect`` so SQLite reuses them instead of
+    creating sidecars with inherited directory permissions (issue #1559).
     """
     # Not on Windows: there 0o700 sets a DACL that names the directory's owner, not the
     # user, so a directory first created by an elevated run would lock the user out.
@@ -64,10 +99,11 @@ def _secure_store_files(path: Path) -> str | None:
     except FileExistsError:
         pass
     if not os.path.isfile(real):
-        return None  # no regular db, so "<path>-wal" is no sidecar
+        return None, ()  # no regular db, so "<path>-wal" is no sidecar
     if sys.platform == "win32":
+        created = _precreate_win32_sidecars(path)
         harden_files_once((real, *_win32_sidecar_paths(path, real)))
-        return real
+        return real, created
     for target in (real, f"{real}-wal", f"{real}-shm"):
         try:
             mode = os.lstat(target).st_mode
@@ -81,7 +117,7 @@ def _secure_store_files(path: Path) -> str | None:
                 file=os.path.basename(target),
                 error=type(exc).__name__,
             )
-    return real
+    return real, ()
 
 
 def _utc_now() -> str:
@@ -272,8 +308,9 @@ class DataStore:
 
     @classmethod
     def open(cls, path: Path) -> DataStore:
+        created_sidecars: tuple[str, ...] = ()
         try:
-            real = _secure_store_files(path)
+            real, created_sidecars = _secure_store_files(path)
             conn = sqlite3.connect(path, isolation_level=None)
             try:
                 conn.row_factory = sqlite3.Row
@@ -289,9 +326,14 @@ class DataStore:
                 conn.close()
                 raise
         except DataMigrationError:
+            _cleanup_empty_sidecars(created_sidecars)
             raise
         except (sqlite3.Error, OSError) as exc:
+            _cleanup_empty_sidecars(created_sidecars)
             raise DataStoreError(detail=str(exc), route="data.open") from exc
+        except BaseException:
+            _cleanup_empty_sidecars(created_sidecars)
+            raise
 
     @classmethod
     def open_readonly(cls, path: Path) -> DataStore:

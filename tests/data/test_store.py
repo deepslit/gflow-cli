@@ -483,6 +483,82 @@ def test_open_tightens_existing_loose_windows_wal_and_shm(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DACLs")
+def test_open_hardens_windows_sidecars_before_sqlite_connects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty -wal/-shm files are created, restricted, and reused by SQLite (#1559)."""
+    _grant_everyone_read(tmp_path)
+    user = _win_current_user()
+    db = tmp_path / "gflow.db"
+    wal = db.with_name("gflow.db-wal")
+    shm = db.with_name("gflow.db-shm")
+    real_connect = sqlite3.connect
+    pre_connect_ids: list[dict[str, tuple[int, int, int]]] = []
+
+    def _id(p: Path) -> tuple[int, int, int]:
+        st = os.lstat(p)
+        return (st.st_dev, st.st_ino, int(getattr(st, "st_birthtime_ns", st.st_ctime_ns)))
+
+    def spy_connect(target: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if target == db:
+            for item in (db, wal, shm):
+                assert item.is_file()
+                _assert_single_user_acl(item, user)
+            assert wal.stat().st_size == 0
+            assert shm.stat().st_size == 0
+            pre_connect_ids.append({"wal": _id(wal), "shm": _id(shm)})
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+
+    with DataStore.open(db):
+        assert len(pre_connect_ids) == 1
+        assert _id(wal) == pre_connect_ids[0]["wal"]
+        assert _id(shm) == pre_connect_ids[0]["shm"]
+        assert wal.stat().st_size > 0 and shm.stat().st_size > 0
+        _assert_single_user_acl(wal, user)
+        _assert_single_user_acl(shm, user)
+
+    assert not wal.exists() and not shm.exists()
+
+    with DataStore.open(db) as reopened:
+        assert len(pre_connect_ids) == 2
+        assert _id(wal) == pre_connect_ids[1]["wal"]
+        assert _id(shm) == pre_connect_ids[1]["shm"]
+        _assert_single_user_acl(wal, user)
+        _assert_single_user_acl(shm, user)
+        reopened.conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
+
+    assert not wal.exists() and not shm.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DACLs")
+def test_open_cleans_up_precreated_sidecars_on_failed_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failed DataStore.open removes empty pre-created sidecars, keeping prior files (#1559)."""
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not a sqlite database" * 4)
+    with pytest.raises(DataStoreError):
+        DataStore.open(corrupt)
+    assert not corrupt.with_name("corrupt.db-wal").exists()
+    assert not corrupt.with_name("corrupt.db-shm").exists()
+
+    corrupt2 = tmp_path / "corrupt2.db"
+    existing_wal = corrupt2.with_name("corrupt2.db-wal")
+    existing_wal.touch()
+
+    def refuse_connect(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(sqlite3, "connect", refuse_connect)
+    with pytest.raises(DataStoreError):
+        DataStore.open(corrupt2)
+    assert existing_wal.exists()
+    assert not corrupt2.with_name("corrupt2.db-shm").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DACLs")
 def test_open_skips_same_identity_and_rehardens_externally_replaced_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -586,6 +662,26 @@ def test_open_never_hardens_windows_non_db_or_symlink_targets(tmp_path: Path) ->
         _assert_single_user_acl(target_shm, user)
         _assert_single_user_acl(tmp_path / "linked.db-wal", user)
         _assert_single_user_acl(tmp_path / "linked.db-shm", user)
+
+    never_created = tmp_path / "never_created.txt"
+    dangling_wal = tmp_path / "dangling.db-wal"
+    dangling_wal.symlink_to(never_created)
+    _real, created = _secure_store_files(tmp_path / "dangling.db")
+    try:
+        assert not never_created.exists()
+        assert [os.path.normcase(p) for p in created] == [
+            os.path.normcase(str(tmp_path / "dangling.db-shm"))
+        ]
+    finally:
+        store_module._cleanup_empty_sidecars(created)
+
+    target2 = real_dir / "target2.db"
+    link2 = tmp_path / "linked2.db"
+    link2.symlink_to(target2)
+    with DataStore.open(link2):
+        pass
+    assert not (real_dir / "target2.db-wal").exists()
+    assert not (real_dir / "target2.db-shm").exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DACLs")

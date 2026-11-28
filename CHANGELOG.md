@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows SQLite `-wal` and `-shm` sidecars are now pre-created empty and restricted before SQLite connects ([#1559](https://github.com/ffroliva/gflow-cli/issues/1559)).** `_secure_store_files` in `src/gflow_cli/data/store.py` previously restricted `-wal`/`-shm` after `PRAGMA journal_mode = WAL` and migrations, leaving a brief window under `GFLOW_CLI_DB_PATH` in a shared directory where SQLite first opened those sidecars with the directory's inherited ACL. Absent Windows sidecars beside the opened path are now created empty with `O_EXCL` (skipping existing paths and symlinks) and hardened before `sqlite3.connect` so SQLite reuses the owner-only files in place; empty sidecars created during a failed `DataStore.open` are removed on cleanup.
+
 ## [0.108.0] — 2026-11-28
 
 ### Highlights: headless by default ([#1371](https://github.com/ffroliva/gflow-cli/issues/1371))

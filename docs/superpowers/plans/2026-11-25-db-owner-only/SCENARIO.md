@@ -35,7 +35,7 @@ fix is there. Read-only opens create nothing and change nothing.
 | 11 | D5 | Two processes open a missing database at once | Medium | The second sees an existing file and continues | Review probe |
 | 14 | D5 | Two threads create the database at once | High | The second waits until the first has closed the new file | Unit (both) |
 | 12 | D12 | A non-owner opens a shared database repeatedly | Low | One warning per file it cannot tighten, on each open | Not tested |
-| 13 | D6 | Windows `-wal` and `-shm` files in a readable directory (fresh open, reopen, crash leftovers, symlinked DB) | High | Restricted to the current user on `DataStore.open` and re-hardened across SQLite sidecar recreations | Unit (Windows) |
+| 13 | D6 | Windows `-wal` and `-shm` files in a readable directory (fresh open, reopen, crash leftovers, symlinked DB) | High | Absent `-wal`/`-shm` are pre-created empty and restricted before `sqlite3.connect` first writes them (#1559), crash leftovers and recreated sidecars are tightened | Unit (Windows) |
 
 ## Must-cover before merge (Critical + High)
 
@@ -44,6 +44,5 @@ real elevated run.
 
 ## Deferred (Medium + Low)
 
-Rows 11 (checked by a probe, no test) and 12; explicit grants that survive on an existing
-Windows database or sidecar file; and the brief window between SQLite creating `-wal`/`-shm`
-and `DataStore.open` stripping inherited directory ACEs.
+Rows 11 (checked by a probe, no test) and 12; and explicit grants that survive on an existing
+Windows database or sidecar file.
